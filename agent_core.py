@@ -1,35 +1,27 @@
 """
-agent_core.py — Core agentic loop for an accounting assistant.
-
-This is the "brain": a tool-calling loop built on the Anthropic Messages API.
-It reads a task, lets Claude pick a tool, runs it, feeds the result back, and
-repeats until the task is done. Tools are pluggable via the @tool decorator.
-
-Run:
-    pip install anthropic
-    export ANTHROPIC_API_KEY="sk-ant-..."
-    python agent_core.py "List my pending VAT tasks for this month"
-
-Two demo tools are registered so the loop runs out of the box. Replace/extend
-them with your Zoho Books, Excel, and email tools using the same pattern.
+agent_core.py — Core agentic loop using DeepSeek AI (OpenAI-compatible API).
 """
 
 import json
 import os
 import sys
-import inspect
+import requests
 from datetime import datetime, date
 from typing import Callable, Any, Optional
-
-import anthropic
 
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
 
-MODEL = "claude-sonnet-4-6"      # fast + capable for an agent loop; swap to claude-opus-4-8 for hard reasoning
+MODEL      = "deepseek-chat"
 MAX_TOKENS = 2048
-MAX_TURNS = 15                   # safety cap so the loop can't run forever
+MAX_TURNS  = 15
+
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 SYSTEM_PROMPT = f"""You are an all-round personal assistant for Waseem Ali at Al Dhuhayan family office in Saudi Arabia.
 Today is {date.today():%Y-%m-%d}.
@@ -64,32 +56,26 @@ HOW YOU WORK:
 - When done, give a short clear summary.
 """
 
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
-
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-
 
 # ----------------------------------------------------------------------------
 # Tool registry
 # ----------------------------------------------------------------------------
-# Each tool is a Python function plus an Anthropic tool schema. The @tool
-# decorator registers both. Set requires_approval=True for anything that
-# writes data, moves money, or sends an external message.
 
 _TOOLS: dict[str, dict] = {}
 
 
 def tool(name: str, description: str, schema: dict, requires_approval: bool = False):
-    """Register a function as a tool the agent can call."""
     def wrapper(fn: Callable[..., Any]):
         _TOOLS[name] = {
             "fn": fn,
             "requires_approval": requires_approval,
             "spec": {
-                "name": name,
-                "description": description,
-                "input_schema": schema,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": schema,
+                },
             },
         }
         return fn
@@ -97,28 +83,23 @@ def tool(name: str, description: str, schema: dict, requires_approval: bool = Fa
 
 
 def tool_specs() -> list[dict]:
-    """The schemas sent to the API so Claude knows what it can call."""
     return [t["spec"] for t in _TOOLS.values()]
 
 
 def run_tool(name: str, args: dict) -> str:
-    """Execute a registered tool, enforcing the approval guardrail."""
     entry = _TOOLS.get(name)
     if not entry:
         return f"ERROR: unknown tool '{name}'"
-
     if entry["requires_approval"] and not _approve(name, args):
         return "DENIED: the human declined this action. Do not retry it."
-
     try:
         result = entry["fn"](**args)
         return result if isinstance(result, str) else json.dumps(result, default=str)
-    except Exception as e:  # tool errors go back to the model so it can recover
+    except Exception as e:
         return f"ERROR running {name}: {e}"
 
 
 def _approve(name: str, args: dict) -> bool:
-    """Terminal approval prompt for sensitive tools. Swap for Telegram later."""
     print(f"\n  APPROVAL NEEDED -> {name}({json.dumps(args, ensure_ascii=False)})")
     return input("  Approve? [y/N] ").strip().lower() == "y"
 
@@ -156,49 +137,57 @@ def record_note(text: str):
 
 
 # ----------------------------------------------------------------------------
-# The core loop
+# Core agent loop (DeepSeek / OpenAI-compatible)
 # ----------------------------------------------------------------------------
 
 def run_agent(task: str) -> str:
-    """Run the agent until the task is done or MAX_TURNS is hit."""
-    messages = [{"role": "user", "content": task}]
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": task},
+    ]
+
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type":  "application/json",
+    }
 
     for turn in range(1, MAX_TURNS + 1):
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            tools=tool_specs(),
-            messages=messages,
-        )
+        payload = {
+            "model":      MODEL,
+            "messages":   messages,
+            "tools":      tool_specs(),
+            "tool_choice": "auto",
+            "max_tokens": MAX_TOKENS,
+        }
 
-        # Print any text the model produced this turn (its reasoning / answer).
-        for block in response.content:
-            if block.type == "text" and block.text.strip():
-                print(f"\n[agent] {block.text.strip()}")
+        r = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=60)
+        r.raise_for_status()
+        data = r.json()
 
-        # No tool requested -> the model is done.
-        if response.stop_reason != "tool_use":
-            final = " ".join(b.text for b in response.content if b.type == "text")
-            return final.strip()
+        choice  = data["choices"][0]
+        message = choice["message"]
+        messages.append(message)
 
-        # Otherwise: record the assistant turn, run each requested tool,
-        # and send the results back as a single user message.
-        messages.append({"role": "assistant", "content": response.content})
+        # Print reasoning text if any
+        if message.get("content"):
+            print(f"\n[agent] {message['content']}")
 
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"[tool] -> {block.name}({json.dumps(block.input, ensure_ascii=False)})")
-                output = run_tool(block.name, block.input)
-                print(f"[tool] <- {output[:300]}")
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
+        # No tool call — model is done
+        if choice["finish_reason"] != "tool_calls" or not message.get("tool_calls"):
+            return (message.get("content") or "").strip()
 
-        messages.append({"role": "user", "content": tool_results})
+        # Run each tool call and feed results back
+        for tc in message["tool_calls"]:
+            fn_name = tc["function"]["name"]
+            fn_args = json.loads(tc["function"]["arguments"])
+            print(f"[tool] -> {fn_name}({json.dumps(fn_args, ensure_ascii=False)})")
+            output = run_tool(fn_name, fn_args)
+            print(f"[tool] <- {output[:300]}")
+            messages.append({
+                "role":         "tool",
+                "tool_call_id": tc["id"],
+                "content":      output,
+            })
 
     return "Stopped: reached the maximum number of turns without finishing."
 
@@ -208,9 +197,9 @@ def run_agent(task: str) -> str:
 # ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    task = " ".join(sys.argv[1:]) or "What pending tasks do I have, and which is most urgent?"
+    task = " ".join(sys.argv[1:]) or "What pending tasks do I have?"
     print(f"TASK: {task}")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        sys.exit("Set ANTHROPIC_API_KEY first:  export ANTHROPIC_API_KEY=sk-ant-...")
+    if not DEEPSEEK_API_KEY:
+        sys.exit("Set DEEPSEEK_API_KEY first.")
     summary = run_agent(task)
     print(f"\n{'='*60}\nDONE: {summary}")
