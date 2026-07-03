@@ -7,12 +7,26 @@ import os
 import glob
 import json
 import requests
-import fitz          # PyMuPDF
-import docx
+
+try:
+    import fitz
+except ImportError:
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        fitz = None
+
+try:
+    import docx
+except ImportError:
+    docx = None
 
 from agent_core import tool, BOT_TOKEN, CHAT_ID
 
-WASEEM_DATA = "/Users/waseemali/Library/CloudStorage/OneDrive-AbdullahTurkeyAlduhayansonsforconstruction/Waseem Data"
+WASEEM_DATA = os.environ.get(
+    "WASEEM_DATA_PATH",
+    "/Users/waseemali/Library/CloudStorage/OneDrive-AbdullahTurkeyAlduhayansonsforconstruction/Waseem Data"
+)
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
@@ -106,6 +120,8 @@ def find_file(name: str):
     },
 )
 def read_pdf(path: str, pages: str = None):
+    if fitz is None:
+        return "ERROR: PDF reading not available — pymupdf not installed."
     full = os.path.join(WASEEM_DATA, path)
     if not os.path.exists(full):
         matches = glob.glob(os.path.join(WASEEM_DATA, "**", f"*{os.path.basename(path)}*"), recursive=True)
@@ -150,6 +166,8 @@ def read_pdf(path: str, pages: str = None):
     },
 )
 def read_word(path: str):
+    if docx is None:
+        return "ERROR: Word reading not available — python-docx not installed."
     full = os.path.join(WASEEM_DATA, path)
     if not os.path.exists(full):
         matches = glob.glob(os.path.join(WASEEM_DATA, "**", f"*{os.path.basename(path)}*"), recursive=True)

@@ -9,7 +9,10 @@ import openpyxl
 
 from agent_core import tool
 
-WASEEM_DATA = "/Users/waseemali/Library/CloudStorage/OneDrive-AbdullahTurkeyAlduhayansonsforconstruction/Waseem Data"
+WASEEM_DATA = os.environ.get(
+    "WASEEM_DATA_PATH",
+    "/Users/waseemali/Library/CloudStorage/OneDrive-AbdullahTurkeyAlduhayansonsforconstruction/Waseem Data"
+)
 PETTY_CASH  = os.path.join(WASEEM_DATA, "Task/Petty Cash Sheet.xlsx")
 TIME_DEP    = os.path.join(WASEEM_DATA, "2025 time deposit & murabaha.xlsx")
 
